@@ -90,7 +90,7 @@ def parse_option():
     parser.add_argument('--optim', type=str, help='overwrite optimizer if provided, can be adamw/sgd.')
 
     # EMA related parameters
-    parser.add_argument('--model_ema', type=str2bool, default=True)
+    parser.add_argument('--model_ema', type=str2bool, default=False)
     parser.add_argument('--model_ema_decay', type=float, default=0.9999, help='')
     parser.add_argument('--model_ema_force_cpu', type=str2bool, default=False, help='')
 
@@ -102,6 +102,40 @@ def parse_option():
 
     return args, config
 
+# Modified function to save best model weights only
+def save_best_model(config, model_without_ddp, optimizer, lr_scheduler, loss_scaler, logger, 
+                model_ema=None, is_best=False, tag='best'):
+    """Save model weights only when a new best accuracy is achieved
+    
+    Args:
+        config: Training configuration
+        model_without_ddp: Model without distributed data parallel wrapper
+        optimizer: Optimizer state
+        lr_scheduler: Learning rate scheduler state
+        loss_scaler: Loss scaler for AMP
+        logger: Logger for printing information
+        model_ema: Exponential Moving Average model (optional)
+        is_best: Boolean indicating if this is the best model so far
+        tag: Tag to add to saved checkpoint (default: 'best')
+    """
+    if not is_best:
+        return
+
+    save_state = {
+        'model': model_without_ddp.state_dict(),
+        'optimizer': optimizer.state_dict(),
+        'lr_scheduler': lr_scheduler.state_dict(),
+        'scaler': loss_scaler.state_dict(),
+        'config': config,
+    }
+
+    if model_ema is not None:
+        save_state['model_ema'] = model_ema.ema.state_dict()
+    
+    save_path = os.path.join(config.OUTPUT, f'{tag}.pth')
+    logger.info(f"{tag} saving checkpoint to {save_path}")
+    torch.save(save_state, save_path)
+    logger.info(f"Saved best model with accuracy: {tag}")
 
 def main(config, args):
     dataset_train, dataset_val, data_loader_train, data_loader_val, mixup_fn = build_loader(config)
@@ -204,24 +238,45 @@ def main(config, args):
         data_loader_train.sampler.set_epoch(epoch)
 
         train_one_epoch(config, model, criterion, data_loader_train, optimizer, epoch, mixup_fn, lr_scheduler, loss_scaler, model_ema)
-        if dist.get_rank() == 0 and (epoch % config.SAVE_FREQ == 0 or epoch == (config.TRAIN.EPOCHS - 1)):
-            save_checkpoint_ema(config, epoch, model_without_ddp, max_accuracy, optimizer, lr_scheduler, loss_scaler, logger, model_ema, max_accuracy_ema)
 
+        # 使用val数据集验证当前epoch的模型
         acc1, acc5, loss = validate(config, data_loader_val, model)
         logger.info(f"Accuracy of the network on the {len(dataset_val)} test images: {acc1:.1f}%")
+
+        # Check if current model is the best so far
+        is_best = acc1 > max_accuracy
         max_accuracy = max(max_accuracy, acc1)
         logger.info(f'Max accuracy: {max_accuracy:.2f}%')
+
+        if dist.get_rank() == 0:
+            save_best_model(
+                config, 
+                model_without_ddp, 
+                optimizer, 
+                lr_scheduler, 
+                loss_scaler, 
+                logger, 
+                is_best=is_best, 
+                tag=f'best_model'
+            )
+
+        # Handle EMA model similarly
         if model_ema is not None:
             acc1_ema, acc5_ema, loss_ema = validate(config, data_loader_val, model_ema.ema)
-            logger.info(f"Accuracy of the network on the {len(dataset_val)} test images: {acc1_ema:.1f}%")
+            logger.info(f"Accuracy of the network ema on the {len(dataset_val)} test images: {acc1_ema:.1f}%")
+            
+            is_best_ema = acc1_ema > max_accuracy_ema
             max_accuracy_ema = max(max_accuracy_ema, acc1_ema)
             logger.info(f'Max accuracy ema: {max_accuracy_ema:.2f}%')
-
+            
+            # Save EMA model only if it's the best so far
+            if dist.get_rank() == 0:
+                save_best_model(config, model_without_ddp, optimizer, lr_scheduler, loss_scaler, 
+                              logger, model_ema=model_ema, is_best=is_best_ema, tag=f'best_model_ema')
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     logger.info('Training time {}'.format(total_time_str))
-
 
 def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mixup_fn, lr_scheduler, loss_scaler, model_ema=None, model_time_warmup=50):
     model.train()

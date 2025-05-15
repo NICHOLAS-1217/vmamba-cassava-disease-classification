@@ -52,18 +52,18 @@ _C.MODEL = CN()
 # Model type
 _C.MODEL.TYPE = 'vssm'
 # Model name
-_C.MODEL.NAME = 'vssm_tiny_224'
+_C.MODEL.NAME = 'vssm1_small_0229'
 # Pretrained weight from checkpoint, could be imagenet22k pretrained weight
 # could be overwritten by command line argument
-_C.MODEL.PRETRAINED = ''
+_C.MODEL.PRETRAINED = 'models/pretrained/small/vssm_small_0229_ckpt_epoch_222.pth'
 # Checkpoint to resume, could be overwritten by command line argument
-_C.MODEL.RESUME = ''
+_C.MODEL.RESUME = 'models/pretrained/small/vssm_small_0229_ckpt_epoch_222.pth'
 # Number of classes, overwritten in data preparation
-_C.MODEL.NUM_CLASSES = 1000
+_C.MODEL.NUM_CLASSES = 5
 # Dropout rate
 _C.MODEL.DROP_RATE = 0.0
 # Drop path rate
-_C.MODEL.DROP_PATH_RATE = 0.1
+_C.MODEL.DROP_PATH_RATE = 0.3
 # Label Smoothing
 _C.MODEL.LABEL_SMOOTHING = 0.1
 
@@ -74,7 +74,7 @@ _C.MODEL.MMCKPT = False
 _C.MODEL.VSSM = CN()
 _C.MODEL.VSSM.PATCH_SIZE = 4
 _C.MODEL.VSSM.IN_CHANS = 3
-_C.MODEL.VSSM.DEPTHS = [2, 2, 9, 2]
+_C.MODEL.VSSM.DEPTHS = [2, 2, 15, 2]
 _C.MODEL.VSSM.EMBED_DIM = 96
 _C.MODEL.VSSM.SSM_D_STATE = 16
 _C.MODEL.VSSM.SSM_RATIO = 2.0
@@ -101,8 +101,8 @@ _C.MODEL.VSSM.GMLP = False
 # -----------------------------------------------------------------------------
 _C.TRAIN = CN()
 _C.TRAIN.START_EPOCH = 0
-_C.TRAIN.EPOCHS = 300
-_C.TRAIN.WARMUP_EPOCHS = 20
+_C.TRAIN.EPOCHS = 100
+_C.TRAIN.WARMUP_EPOCHS = 5
 _C.TRAIN.WEIGHT_DECAY = 0.05
 _C.TRAIN.BASE_LR = 5e-4
 _C.TRAIN.WARMUP_LR = 5e-7
@@ -122,7 +122,7 @@ _C.TRAIN.USE_CHECKPOINT = False
 _C.TRAIN.LR_SCHEDULER = CN()
 _C.TRAIN.LR_SCHEDULER.NAME = 'cosine'
 # Epoch interval to decay LR, used in StepLRScheduler
-_C.TRAIN.LR_SCHEDULER.DECAY_EPOCHS = 30
+_C.TRAIN.LR_SCHEDULER.DECAY_EPOCHS = 10
 # LR decay rate, used in StepLRScheduler
 _C.TRAIN.LR_SCHEDULER.DECAY_RATE = 0.1
 # warmup_prefix used in CosineLRScheduler
