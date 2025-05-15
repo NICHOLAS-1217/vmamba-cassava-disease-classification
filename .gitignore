@@ -38,7 +38,6 @@ classification/1.log
 kernels/selective_scan/test_selective_scan_speed.py
 kernels/selective_scan/test_selective_scan_easy.py
 kernels/selective_scan/ssmtriton.py
-test.sh
 classification/models/vmamba copy.py
 kernels/selective_scan/ssmjax.py
 classification/models/vheat_wzz.py
