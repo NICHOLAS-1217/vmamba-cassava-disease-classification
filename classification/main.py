@@ -167,7 +167,6 @@ def main(config, args):
             resume='')
         print("Using EMA with decay = %.8f" % args.model_ema_decay)
 
-
     optimizer = build_optimizer(config, model, logger)
     model = torch.nn.parallel.DistributedDataParallel(model, broadcast_buffers=False)
     loss_scaler = NativeScalerWithGradNormCount()
@@ -187,6 +186,7 @@ def main(config, args):
 
     max_accuracy = 0.0
     max_accuracy_ema = 0.0
+    max_train_accuracy = 0.0
 
     if config.TRAIN.AUTO_RESUME:
         resume_file = auto_resume_helper(config.OUTPUT)
@@ -231,24 +231,33 @@ def main(config, args):
             throughput(data_loader_val, model_ema.ema, logger)
         return
 
-
     logger.info("Start training")
     start_time = time.time()
     for epoch in range(config.TRAIN.START_EPOCH, config.TRAIN.EPOCHS):
         data_loader_train.sampler.set_epoch(epoch)
 
-        train_one_epoch(config, model, criterion, data_loader_train, optimizer, epoch, mixup_fn, lr_scheduler, loss_scaler, model_ema)
+        # 运行train_one_epoch并获取返回值
+        train_acc1, train_acc5, train_loss = train_one_epoch(
+            config, model, criterion, data_loader_train, optimizer, 
+            epoch, mixup_fn, lr_scheduler, loss_scaler, model_ema
+        )
+        
+        # 输出训练准确率
+        if dist.get_rank() == 0:
+            logger.info(f"Training accuracy on epoch {epoch}: {train_acc1:.1f}%")
+        
+        max_train_accuracy = max(max_train_accuracy, train_acc1)
 
         # 使用val数据集验证当前epoch的模型
         acc1, acc5, loss = validate(config, data_loader_val, model)
-        logger.info(f"Accuracy of the network on the {len(dataset_val)} test images: {acc1:.1f}%")
+        logger.info(f"Validation accuracy on the {len(dataset_val)} test images: {acc1:.1f}%")
 
-        # Check if current model is the best so far
+        # 比较和更新最佳准确率
         is_best = acc1 > max_accuracy
         max_accuracy = max(max_accuracy, acc1)
-        logger.info(f'Max accuracy: {max_accuracy:.2f}%')
-
+        
         if dist.get_rank() == 0:
+            logger.info(f'Max training accuracy: {max_train_accuracy:.2f}%, Max validation accuracy: {max_accuracy:.2f}%')
             save_best_model(
                 config, 
                 model_without_ddp, 
@@ -260,23 +269,35 @@ def main(config, args):
                 tag=f'best_model'
             )
 
-        # Handle EMA model similarly
+        # EMA模型处理
         if model_ema is not None:
             acc1_ema, acc5_ema, loss_ema = validate(config, data_loader_val, model_ema.ema)
-            logger.info(f"Accuracy of the network ema on the {len(dataset_val)} test images: {acc1_ema:.1f}%")
+            logger.info(f"Validation accuracy of the EMA network: {acc1_ema:.1f}%")
             
             is_best_ema = acc1_ema > max_accuracy_ema
             max_accuracy_ema = max(max_accuracy_ema, acc1_ema)
-            logger.info(f'Max accuracy ema: {max_accuracy_ema:.2f}%')
             
-            # Save EMA model only if it's the best so far
             if dist.get_rank() == 0:
-                save_best_model(config, model_without_ddp, optimizer, lr_scheduler, loss_scaler, 
-                              logger, model_ema=model_ema, is_best=is_best_ema, tag=f'best_model_ema')
+                logger.info(f'Max validation accuracy EMA: {max_accuracy_ema:.2f}%')
+                save_best_model(
+                    config, 
+                    model_without_ddp, 
+                    optimizer, 
+                    lr_scheduler, 
+                    loss_scaler, 
+                    logger, 
+                    model_ema=model_ema, 
+                    is_best=is_best_ema, 
+                    tag=f'best_model_ema'
+                )
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     logger.info('Training time {}'.format(total_time_str))
+    logger.info(f"Best validation accuracy: {max_accuracy:.2f}%")
+    logger.info(f"Best training accuracy: {max_train_accuracy:.2f}%")
+    if model_ema is not None:
+        logger.info(f"Best EMA validation accuracy: {max_accuracy_ema:.2f}%")
 
 def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mixup_fn, lr_scheduler, loss_scaler, model_ema=None, model_time_warmup=50):
     model.train()
@@ -289,6 +310,8 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
     loss_meter = AverageMeter()
     norm_meter = AverageMeter()
     scaler_meter = AverageMeter()
+    acc1_meter = AverageMeter()  # 添加训练准确率计量器
+    acc5_meter = AverageMeter()  # 添加top5准确率计量器
 
     start = time.time()
     end = time.time()
@@ -296,6 +319,9 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
         torch.cuda.reset_peak_memory_stats()
         samples = samples.cuda(non_blocking=True)
         targets = targets.cuda(non_blocking=True)
+        
+        # 保存原始目标用于准确率计算
+        original_targets = targets.clone()
 
         if mixup_fn is not None:
             samples, targets = mixup_fn(samples, targets)
@@ -306,6 +332,22 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
             outputs = model(samples)
         loss = criterion(outputs, targets)
         loss = loss / config.TRAIN.ACCUMULATION_STEPS
+
+        # 计算训练准确率
+        if mixup_fn is None:  # 如果没有使用mixup，直接计算准确率
+            with torch.no_grad():
+                acc1, acc5 = accuracy(outputs, targets, topk=(1, 5))
+                acc1 = reduce_tensor(acc1)
+                acc5 = reduce_tensor(acc5)
+                acc1_meter.update(acc1.item(), targets.size(0))
+                acc5_meter.update(acc5.item(), targets.size(0))
+        else:  # 如果使用了mixup，使用原始目标计算近似准确率
+            with torch.no_grad():
+                acc1, acc5 = accuracy(outputs, original_targets, topk=(1, 5))
+                acc1 = reduce_tensor(acc1)
+                acc5 = reduce_tensor(acc5)
+                acc1_meter.update(acc1.item(), original_targets.size(0))
+                acc5_meter.update(acc5.item(), original_targets.size(0))
 
         # this attribute is added by timm on one optimizer (adahessian)
         is_second_order = hasattr(optimizer, 'is_second_order') and optimizer.is_second_order
@@ -343,11 +385,19 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
                 f'data time {data_time.val:.4f} ({data_time.avg:.4f})\t'
                 f'model time {model_time.val:.4f} ({model_time.avg:.4f})\t'
                 f'loss {loss_meter.val:.4f} ({loss_meter.avg:.4f})\t'
+                f'train_acc@1 {acc1_meter.val:.3f} ({acc1_meter.avg:.3f})\t'
+                f'train_acc@5 {acc5_meter.val:.3f} ({acc5_meter.avg:.3f})\t'
                 f'grad_norm {norm_meter.val:.4f} ({norm_meter.avg:.4f})\t'
                 f'loss_scale {scaler_meter.val:.4f} ({scaler_meter.avg:.4f})\t'
                 f'mem {memory_used:.0f}MB')
+    
+    # 在epoch结束时输出训练准确率
+    logger.info(f'EPOCH {epoch} training accuracy: Acc@1 {acc1_meter.avg:.3f} Acc@5 {acc5_meter.avg:.3f}')
     epoch_time = time.time() - start
     logger.info(f"EPOCH {epoch} training takes {datetime.timedelta(seconds=int(epoch_time))}")
+    
+    # 明确返回训练准确率和损失
+    return acc1_meter.avg, acc5_meter.avg, loss_meter.avg
 
 
 @torch.no_grad()
